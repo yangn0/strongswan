@@ -1,3 +1,4 @@
+#define __rtems__
 /*
  * Copyright (C) 2013 Tobias Brunner
  * Copyright (C) 2013 Martin Willi
@@ -142,6 +143,7 @@ static peer_cfg_t* create_peer_cfg(private_cmd_connection_t *this)
 	ike_cfg_t *ike_cfg;
 	peer_cfg_t *peer_cfg;
 	proposal_t *proposal;
+#ifndef __rtems__
 	ike_cfg_create_t ike = {
 		.local = "0.0.0.0",
 		.remote = this->host,
@@ -157,6 +159,25 @@ static peer_cfg_t* create_peer_cfg(private_cmd_connection_t *this)
 		.over_time = 600, /* 10min */
 		.dpd = 30,
 	};
+#else
+	ike_cfg_create_t ike = {
+		.local = "%any",
+		.remote = this->host,
+		.remote_port = IKEV2_UDP_PORT,
+		.fragmentation = FRAGMENTATION_YES,
+	};
+	peer_cfg_create_t peer = {
+		.cert_policy = CERT_SEND_IF_ASKED,
+		.unique = UNIQUE_NO,
+		.no_mobike=TRUE,
+		// .reauth_time=10
+		.keyingtries = 1,
+		.rekey_time = 10, /* 10h */
+		.jitter_time = 1, /* 10min */
+		.over_time = 1, /* 10min */
+		// .dpd = 30,
+	};
+#endif
 
 	switch (this->profile)
 	{
@@ -197,7 +218,9 @@ static peer_cfg_t* create_peer_cfg(private_cmd_connection_t *this)
 	else
 	{
 		ike_cfg->add_proposal(ike_cfg, proposal_create_default(PROTO_IKE));
+#ifndef __rtems__
 		ike_cfg->add_proposal(ike_cfg, proposal_create_default_aead(PROTO_IKE));
+#endif
 	}
 	peer_cfg = peer_cfg_create("cmd", ike_cfg, &peer);
 
@@ -336,15 +359,17 @@ static child_cfg_t* create_child_cfg(private_cmd_connection_t *this,
 									 peer_cfg_t *peer_cfg)
 {
 	child_cfg_t *child_cfg;
+#ifndef __rtems__
 	traffic_selector_t *ts;
+#endif
 	proposal_t *proposal;
 	bool has_v4 = FALSE, has_v6 = FALSE;
 	child_cfg_create_t child = {
 		.lifetime = {
 			.time = {
-				.life = 10800 /* 3h */,
-				.rekey = 10200 /* 2h50min */,
-				.jitter = 300 /* 5min */
+				// .life = 10800 /* 3h */,
+				// .rekey = 10 /* 2h50min */,
+				// .jitter = 300 /* 5min */
 			}
 		},
 		.mode = MODE_TUNNEL,
@@ -361,9 +386,14 @@ static child_cfg_t* create_child_cfg(private_cmd_connection_t *this,
 	}
 	else
 	{
+#ifndef __rtems__
 		child_cfg->add_proposal(child_cfg, proposal_create_default_aead(PROTO_ESP));
+#endif
 		child_cfg->add_proposal(child_cfg, proposal_create_default(PROTO_ESP));
 	}
+#ifdef __rtems__
+	child_cfg->add_traffic_selector(child_cfg, TRUE, traffic_selector_create_dynamic(0, 0, 65535));
+#else
 	while (this->local_ts->remove_first(this->local_ts, (void**)&ts) == SUCCESS)
 	{
 		child_cfg->add_traffic_selector(child_cfg, TRUE, ts);
@@ -376,6 +406,10 @@ static child_cfg_t* create_child_cfg(private_cmd_connection_t *this,
 		this->remote_ts->insert_last(this->remote_ts, ts);
 		has_v4 = TRUE;
 	}
+#endif
+#ifdef __rtems__
+	child_cfg->add_traffic_selector(child_cfg, FALSE, traffic_selector_create_dynamic(0, 0, 65535));
+#else
 	while (this->remote_ts->remove_first(this->remote_ts,
 										 (void**)&ts) == SUCCESS)
 	{
@@ -392,6 +426,8 @@ static child_cfg_t* create_child_cfg(private_cmd_connection_t *this,
 		}
 		child_cfg->add_traffic_selector(child_cfg, FALSE, ts);
 	}
+#endif
+#ifndef __rtems__
 	if (has_v4)
 	{
 		peer_cfg->add_virtual_ip(peer_cfg, host_create_from_string("0.0.0.0", 0));
@@ -400,10 +436,59 @@ static child_cfg_t* create_child_cfg(private_cmd_connection_t *this,
 	{
 		peer_cfg->add_virtual_ip(peer_cfg, host_create_from_string("::", 0));
 	}
+#endif
 	peer_cfg->add_child_cfg(peer_cfg, child_cfg->get_ref(child_cfg));
 
 	return child_cfg;
 }
+#ifdef __rtems__
+typedef struct private_backend_t private_backend_t;
+
+/**
+* Custom backend_t implementation
+*/
+struct private_backend_t {
+
+	/**
+	* Public interface
+	*/
+	backend_t public;
+
+	/**
+	* Responder ike_cfg
+	*/
+	ike_cfg_t *ike_cfg;
+
+	/**
+	* Responder peer_cfg/child_cfg
+	*/
+	peer_cfg_t *peer_cfg;
+};
+
+METHOD(backend_t, create_ike_cfg_enumerator, enumerator_t*,
+private_backend_t *this, host_t *me, host_t *other)
+{
+	return enumerator_create_single(this->ike_cfg, NULL);
+}
+
+METHOD(backend_t, create_peer_cfg_enumerator, enumerator_t*,
+private_backend_t *this, identification_t *me, identification_t *other)
+{
+	return enumerator_create_single(this->peer_cfg, NULL);
+}
+
+/**
+ * Sets the config objects provided by the backend
+ */
+static void set_config(private_backend_t *this, ike_cfg_t *ike,
+					   peer_cfg_t *peer)
+{
+	// DESTROY_IF(this->ike_cfg);
+	this->ike_cfg = ike;
+	// DESTROY_IF(this->peer_cfg);
+	this->peer_cfg = peer;
+}
+#endif /* __rtems__ */
 
 /**
  * Initiate the configured connection
@@ -438,8 +523,27 @@ static job_requeue_t initiate(private_cmd_connection_t *this)
 
 	child_cfg = create_child_cfg(this, peer_cfg);
 
+#ifndef __rtems__
 	if (charon->controller->initiate(charon->controller, peer_cfg, child_cfg,
 				controller_cb_empty, NULL, LEVEL_SILENT, 0, FALSE) != SUCCESS)
+#else /* __rtems__ */
+	private_backend_t *backend;
+
+	INIT(backend,
+	.public = {
+		.create_ike_cfg_enumerator = _create_ike_cfg_enumerator,
+		.create_peer_cfg_enumerator = _create_peer_cfg_enumerator,
+		.get_peer_cfg_by_name = (void*)return_null,
+	},
+	);
+
+	charon->backends->add_backend(charon->backends, &backend->public);
+	set_config(backend, peer_cfg->get_ike_cfg(peer_cfg) , peer_cfg);
+
+	if (charon->controller->initiate(charon->controller,
+		peer_cfg->get_ref(peer_cfg), child_cfg->get_ref(child_cfg),
+		NULL, NULL, 0, 0, FALSE) != SUCCESS)
+#endif
 	{
 		terminate(pid);
 	}
@@ -577,9 +681,11 @@ cmd_connection_t *cmd_connection_create()
 		.profile = PROF_UNDEF,
 	);
 
+#ifndef __rtems__
 	/* always include the virtual IP in traffic selector list */
 	this->local_ts->insert_last(this->local_ts,
 								traffic_selector_create_dynamic(0, 0, 65535));
+#endif
 
 	/* queue job, gets initiated as soon as we are up and running */
 	lib->processor->queue_job(lib->processor,
